@@ -7,10 +7,18 @@ import {
   verifyPaymentSchema,
 } from "./sessions.schemas.js";
 import { sessionsService } from "./sessions.service.js";
+import { getAgenda } from "../../agenda/agenda.js";
+import { BadRequestError, ConflictError } from "../../lib/errors.js";
+import { scheduleOneTimeJob } from "../../agenda/schedulers/schedule-once.js";
+import { scheduleRecurringJob } from "../../agenda/schedulers/schedule-recurring.js";
+
+type SessionParams = {
+  sessionId: string;
+};
 
 export class SessionsController {
-  list(_req: Request, res: Response): void {
-    const sessions = sessionsService.list();
+  async list(_req: Request, res: Response): Promise<void> {
+    const sessions = await sessionsService.list();
 
     res.json({
       ok: true,
@@ -27,19 +35,14 @@ export class SessionsController {
     });
   }
 
-  prepare(req: Request, res: Response): void {
+  async prepare(req: Request, res: Response): Promise<void> {
     const input = prepareSessionSchema.parse(req.body);
-    const session = sessionsService.prepare(input);
+    const session = await sessionsService.prepare(input);
 
-    /*
-      TODO:
-      contract hook area:
-      - init session on Soroban
-      - write quoted amount
-      - write request hash
-      - write expiry
-      - set payment status false
-    */
+    const agenda = getAgenda();
+    await agenda.schedule(new Date(session.expiresAtMs), "session:expire", {
+      sessionId: session.id,
+    });
 
     res.status(201).json({
       ok: true,
@@ -57,9 +60,8 @@ export class SessionsController {
     });
   }
 
-  getById(req: Request, res: Response): void {
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.getOrThrow(sessionId);
+  async getById(req: Request<SessionParams>, res: Response): Promise<void> {
+    const session = await sessionsService.getOrThrow(req.params.sessionId);
 
     res.json({
       ok: true,
@@ -91,62 +93,8 @@ export class SessionsController {
     });
   }
 
-  paymentRequired(req: Request, res: Response): void {
-    const sessionId = String(req.params.sessionId);
-    const response = sessionsService.toPaymentRequired(sessionId);
-
-    res.status(402).json({
-      ok: false,
-      ...response,
-      message: "Payment required",
-    });
-  }
-
-  paymentPending(req: Request, res: Response): void {
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.markPaymentPending(sessionId);
-
-    /*
-      TODO:
-      contract hook area:
-      - optional mark pending in contract
-      - optional attach submitted payer intent
-    */
-
-    res.json({
-      ok: true,
-      sessionId: session.id,
-      status: session.status,
-    });
-  }
-
-  verifyPayment(req: Request, res: Response): void {
-    const input = verifyPaymentSchema.parse(req.body);
-
-    /*
-      TODO:
-      contract hook area:
-      - verify on-chain payment for session/paymentReference/amount
-      - verify txHash really paid this session
-      - verify not already settled
-    */
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.markPaymentVerified(
-      sessionId,
-      input.txHash
-    );
-
-    res.json({
-      ok: true,
-      sessionId: session.id,
-      status: session.status,
-      paymentTxHash: session.paymentTxHash,
-    });
-  }
-
-  execute(req: Request, res: Response): void {
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.getOrThrow(sessionId);
+  async execute(req: Request<SessionParams>, res: Response): Promise<void> {
+    const session = await sessionsService.getOrThrow(req.params.sessionId);
 
     if (
       session.status === "payment_required" ||
@@ -166,25 +114,137 @@ export class SessionsController {
       return;
     }
 
-    const executing = sessionsService.markExecuting(session.id);
+    if (session.status === "payment_verified") {
+      res.status(202).json({
+        ok: true,
+        sessionId: session.id,
+        status: "ready_to_queue",
+        message:
+          "Payment verified. Queueing happens when verification is confirmed.",
+      });
+      return;
+    }
+
+    if (session.status === "executing" || session.status === "completed") {
+      res.json({
+        ok: true,
+        sessionId: session.id,
+        status: session.status,
+      });
+      return;
+    }
+
+    throw new BadRequestError(
+      `Session cannot execute from status ${session.status}`
+    );
+  }
+
+  async paymentPending(
+    req: Request<SessionParams>,
+    res: Response
+  ): Promise<void> {
+    const session = await sessionsService.markPaymentPending(
+      req.params.sessionId
+    );
 
     res.json({
       ok: true,
-      sessionId: executing.id,
-      status: executing.status,
+      sessionId: session.id,
+      status: session.status,
     });
   }
-  complete(req: Request, res: Response): void {
-    const input = completeSessionSchema.parse(req.body);
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.markCompleted(sessionId, input.result);
 
-    /*
-      TODO:
-      contract hook area:
-      - mark session completed on-chain
-      - write result hash if needed
-    */
+  async verifyPayment(
+    req: Request<SessionParams>,
+    res: Response
+  ): Promise<void> {
+    const input = verifyPaymentSchema.parse(req.body);
+    const session = await sessionsService.markPaymentVerified(
+      req.params.sessionId,
+      input.txHash
+    );
+
+    const agenda = getAgenda();
+
+    await agenda.cancel({
+      name: "session:expire",
+      data: { sessionId: session.id },
+    });
+
+    const payload = session.payload as {
+      jobType: "one_time" | "recurring";
+      jobName: string;
+      jobData: {
+        description?: string;
+        callType: "contract_invoke" | "stellar_ops" | "upkeep";
+        params: Record<string, unknown>;
+      };
+      scheduleConfig?: {
+        runAt?: string;
+        startsAt?: string;
+        interval?: string;
+        maxRuns?: number;
+      };
+    };
+
+    let scheduledJobId: string | null = null;
+
+    if (payload.jobType === "one_time") {
+      const job = await scheduleOneTimeJob(agenda, {
+        when: payload.scheduleConfig?.runAt
+          ? new Date(payload.scheduleConfig.runAt)
+          : new Date(),
+        jobId: session.id,
+        type: payload.jobName,
+        payload: {
+          sessionId: session.id,
+          description: payload.jobData.description ?? null,
+          callType: payload.jobData.callType,
+          ...payload.jobData.params,
+        },
+        removeOnComplete: true,
+      });
+
+      scheduledJobId = String(job.attrs._id);
+    } else if (payload.jobType === "recurring") {
+      const job = await scheduleRecurringJob(agenda, {
+        jobId: session.id,
+        type: payload.jobName,
+        interval: payload.scheduleConfig?.interval ?? "1 minute",
+        startsAt: payload.scheduleConfig?.startsAt
+          ? new Date(payload.scheduleConfig.startsAt)
+          : new Date(),
+        maxRuns: payload.scheduleConfig?.maxRuns ?? 1,
+        payload: {
+          sessionId: session.id,
+          description: payload.jobData.description ?? null,
+          callType: payload.jobData.callType,
+          ...payload.jobData.params,
+        },
+        removeOnComplete: true,
+      });
+
+      scheduledJobId = String(job.attrs._id);
+    } else {
+      throw new ConflictError("Unsupported job type");
+    }
+
+    res.status(202).json({
+      ok: true,
+      sessionId: session.id,
+      status: "queued",
+      paymentTxHash: session.paymentTxHash,
+      agendaJobId: scheduledJobId,
+      message: "Payment verified and job queued",
+    });
+  }
+
+  async complete(req: Request<SessionParams>, res: Response): Promise<void> {
+    const input = completeSessionSchema.parse(req.body);
+    const session = await sessionsService.markCompleted(
+      req.params.sessionId,
+      input.result
+    );
 
     res.json({
       ok: true,
@@ -194,17 +254,12 @@ export class SessionsController {
     });
   }
 
-  fail(req: Request, res: Response): void {
+  async fail(req: Request<SessionParams>, res: Response): Promise<void> {
     const input = failSessionSchema.parse(req.body);
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.markFailed(sessionId, input.reason);
-
-    /*
-      TODO:
-      contract hook area:
-      - mark session failed on-chain
-      - store error code or reason hash if needed
-    */
+    const session = await sessionsService.markFailed(
+      req.params.sessionId,
+      input.reason
+    );
 
     res.json({
       ok: true,
@@ -214,15 +269,14 @@ export class SessionsController {
     });
   }
 
-  cancel(req: Request, res: Response): void {
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.cancel(sessionId);
+  async cancel(req: Request<SessionParams>, res: Response): Promise<void> {
+    const session = await sessionsService.cancel(req.params.sessionId);
 
-    /*
-      TODO:
-      contract hook area:
-      - cancel unpaid session on-chain
-    */
+    const agenda = getAgenda();
+    await agenda.cancel({
+      name: "session:expire",
+      data: { sessionId: session.id },
+    });
 
     res.json({
       ok: true,
@@ -231,15 +285,8 @@ export class SessionsController {
     });
   }
 
-  expire(req: Request, res: Response): void {
-    const sessionId = String(req.params.sessionId);
-    const session = sessionsService.expire(sessionId);
-
-    /*
-      TODO:
-      contract hook area:
-      - expire session on-chain
-    */
+  async expire(req: Request<SessionParams>, res: Response): Promise<void> {
+    const session = await sessionsService.expire(req.params.sessionId);
 
     res.json({
       ok: true,
