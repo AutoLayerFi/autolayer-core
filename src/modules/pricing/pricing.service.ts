@@ -9,17 +9,58 @@ export interface PriceEstimate {
 
 class PricingService {
   estimate(routeKey: string, payload: Record<string, unknown>): PriceEstimate {
-    const base = 1000000;
-    const payloadSize = JSON.stringify(payload).length;
+    const typedPayload = payload as {
+      jobType?: "one_time" | "recurring";
+      jobData?: {
+        callType?: "contract_invoke" | "stellar_ops" | "upkeep";
+        params?: Record<string, unknown>;
+        description?: string;
+      };
+      scheduleConfig?: {
+        maxRuns?: number;
+      };
+    };
 
-    let multiplier = 1;
+    const base = 1_000000;
+    const paramsSize = JSON.stringify(
+      typedPayload.jobData?.params ?? {}
+    ).length;
+    const payloadUnits = Math.ceil(paramsSize / 200) * 50000;
 
-    if (routeKey === "automation.execute") multiplier = 2;
-    if (routeKey === "automation.deploy") multiplier = 5;
-    if (routeKey === "automation.preview") multiplier = 1;
+    let routeMultiplier = 1;
+    if (routeKey === "automation.execute") routeMultiplier = 2;
+    if (routeKey === "automation.deploy") routeMultiplier = 5;
 
-    const variable = Math.ceil(payloadSize / 200) * 50000;
-    const amountAtomic = String(base * multiplier + variable);
+    let callTypeFee = 0;
+    switch (typedPayload.jobData?.callType) {
+      case "contract_invoke":
+        callTypeFee = 250000;
+        break;
+      case "stellar_ops":
+        callTypeFee = 200000;
+        break;
+      case "upkeep":
+        callTypeFee = 150000;
+        break;
+      default:
+        callTypeFee = 100000;
+    }
+
+    let schedulingFee = 0;
+    if (typedPayload.jobType === "recurring") {
+      const maxRuns =
+        typeof typedPayload.scheduleConfig?.maxRuns === "number"
+          ? typedPayload.scheduleConfig.maxRuns
+          : 1;
+
+      schedulingFee = 300000 + Math.min(maxRuns, 100) * 10000;
+    } else {
+      schedulingFee = 100000;
+    }
+
+    const amountAtomic = String(
+      base * routeMultiplier + payloadUnits + callTypeFee + schedulingFee
+    );
 
     return {
       amountAtomic,
@@ -27,9 +68,13 @@ class PricingService {
       network: env.DEFAULT_NETWORK,
       breakdown: {
         baseAtomic: String(base),
-        multiplier,
-        payloadSize,
-        variableAtomic: String(variable),
+        routeMultiplier,
+        jobType: typedPayload.jobType ?? "unknown",
+        callType: typedPayload.jobData?.callType ?? "unknown",
+        paramsSize,
+        payloadUnitsAtomic: String(payloadUnits),
+        callTypeFeeAtomic: String(callTypeFee),
+        schedulingFeeAtomic: String(schedulingFee),
       },
     };
   }
